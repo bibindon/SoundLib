@@ -34,12 +34,12 @@ constexpr long kDirectSoundVolumeMax = DSBVOLUME_MAX;
 
 struct WavFile
 {
-    std::vector<BYTE> formatBytes;
+    WAVEFORMATEX format {};
     std::vector<BYTE> audioBytes;
 
     const WAVEFORMATEX* Format() const
     {
-        return reinterpret_cast<const WAVEFORMATEX*>(formatBytes.data());
+        return &format;
     }
 };
 
@@ -59,9 +59,10 @@ struct Voice
     int targetVolume = 100;
     bool isLoop = false;
     bool isEnvironment = false;
+    bool hasSourcePosition = false;
+    Vector3 sourcePosition {};
     EffectType effectType = EffectType::None;
     ComPtr<IDirectSoundBuffer8> buffer;
-    ComPtr<IDirectSound3DBuffer8> buffer3D;
     FadeState fade;
 };
 
@@ -177,8 +178,19 @@ WavFile LoadWaveFile(const std::wstring& filePath)
         const DWORD chunkSize = ReadUInt32(file);
         if (std::strncmp(chunkId, "fmt ", 4) == 0)
         {
-            wavFile.formatBytes.resize(chunkSize);
-            file.read(reinterpret_cast<char*>(wavFile.formatBytes.data()), chunkSize);
+            std::vector<BYTE> formatBytes(chunkSize);
+            file.read(reinterpret_cast<char*>(formatBytes.data()), chunkSize);
+
+            if (chunkSize < sizeof(PCMWAVEFORMAT))
+            {
+                throw std::runtime_error("Unsupported wav format.");
+            }
+
+            std::memcpy(&wavFile.format, formatBytes.data(), std::min<size_t>(chunkSize, sizeof(WAVEFORMATEX)));
+            if (chunkSize < sizeof(WAVEFORMATEX))
+            {
+                wavFile.format.cbSize = 0;
+            }
             foundFormatChunk = true;
         }
         else if (std::strncmp(chunkId, "data", 4) == 0)
@@ -201,11 +213,6 @@ WavFile LoadWaveFile(const std::wstring& filePath)
     if (!foundFormatChunk || !foundDataChunk)
     {
         throw std::runtime_error("The wav file is missing required chunks.");
-    }
-
-    if (wavFile.formatBytes.size() < sizeof(WAVEFORMATEX))
-    {
-        throw std::runtime_error("Unsupported wav format.");
     }
 
     const auto* format = wavFile.Format();
@@ -244,6 +251,41 @@ long ConvertVolumeToDirectSound(int volume)
     return directSoundValue;
 }
 
+float Dot(const Vector3& left, const Vector3& right)
+{
+    return (left.x * right.x) + (left.y * right.y) + (left.z * right.z);
+}
+
+Vector3 Subtract(const Vector3& left, const Vector3& right)
+{
+    return { left.x - right.x, left.y - right.y, left.z - right.z };
+}
+
+Vector3 Cross(const Vector3& left, const Vector3& right)
+{
+    return {
+        (left.y * right.z) - (left.z * right.y),
+        (left.z * right.x) - (left.x * right.z),
+        (left.x * right.y) - (left.y * right.x)
+    };
+}
+
+float Length(const Vector3& value)
+{
+    return std::sqrt(Dot(value, value));
+}
+
+Vector3 Normalize(const Vector3& value)
+{
+    const float length = Length(value);
+    if (length <= 0.0001f)
+    {
+        return { 0.0f, 0.0f, 0.0f };
+    }
+
+    return { value.x / length, value.y / length, value.z / length };
+}
+
 DWORD SecondsToBufferOffset(const WavFile& wavFile, float seconds)
 {
     if (seconds <= 0.0f)
@@ -267,7 +309,7 @@ DWORD SecondsToBufferOffset(const WavFile& wavFile, float seconds)
     return offset;
 }
 
-void SetBufferVolume(IDirectSoundBuffer8& buffer, int volume, EffectType effectType)
+int ApplyEffectVolumeAdjustment(int volume, EffectType effectType)
 {
     int adjustedVolume = volume;
 
@@ -287,7 +329,41 @@ void SetBufferVolume(IDirectSoundBuffer8& buffer, int volume, EffectType effectT
         break;
     }
 
+    return adjustedVolume;
+}
+
+void SetBufferVolume(IDirectSoundBuffer8& buffer, int volume, EffectType effectType)
+{
+    const int adjustedVolume = ApplyEffectVolumeAdjustment(volume, effectType);
     ThrowIfFailed(buffer.SetVolume(ConvertVolumeToDirectSound(adjustedVolume)), "Failed to set buffer volume.");
+}
+
+void SetBufferPan(IDirectSoundBuffer8& buffer, long pan)
+{
+    ThrowIfFailed(buffer.SetPan(std::clamp(pan, -10000L, 10000L)), "Failed to set buffer pan.");
+}
+
+void ApplySpatialSettings(Voice& voice, int volume)
+{
+    if (!voice.hasSourcePosition)
+    {
+        SetBufferVolume(*voice.buffer.Get(), volume, voice.effectType);
+        SetBufferPan(*voice.buffer.Get(), 0);
+        return;
+    }
+
+    const Vector3 relative = Subtract(voice.sourcePosition, g_state.listenerPosition);
+    const float distance = Length(relative);
+    const float attenuation = 1.0f / (1.0f + (distance / 12.0f));
+    const int attenuatedVolume = std::clamp(static_cast<int>(std::lround(volume * attenuation)), 0, 100);
+
+    const Vector3 listenerRight = Normalize(Cross(g_state.listenerTop, g_state.listenerFront));
+    const Vector3 relativeDirection = Normalize(relative);
+    const float panRatio = std::clamp(Dot(relativeDirection, listenerRight), -1.0f, 1.0f);
+    const long pan = static_cast<long>(std::lround(panRatio * 10000.0f));
+
+    SetBufferVolume(*voice.buffer.Get(), attenuatedVolume, voice.effectType);
+    SetBufferPan(*voice.buffer.Get(), pan);
 }
 
 void ApplyEffectType(IDirectSoundBuffer8& buffer, const WAVEFORMATEX& format, EffectType effectType)
@@ -313,19 +389,13 @@ void ApplyEffectType(IDirectSoundBuffer8& buffer, const WAVEFORMATEX& format, Ef
     ThrowIfFailed(buffer.SetFrequency(frequency), "Failed to set buffer frequency.");
 }
 
-ComPtr<IDirectSoundBuffer8> CreateBuffer(const WavFile& wavFile, bool use3D, bool loop)
+ComPtr<IDirectSoundBuffer8> CreateBuffer(const WavFile& wavFile, bool loop)
 {
     DSBUFFERDESC description {};
     description.dwSize = sizeof(description);
-    description.dwFlags = DSBCAPS_CTRLVOLUME | DSBCAPS_CTRLFREQUENCY | DSBCAPS_GLOBALFOCUS;
+    description.dwFlags = DSBCAPS_CTRLVOLUME | DSBCAPS_CTRLFREQUENCY | DSBCAPS_CTRLPAN | DSBCAPS_GLOBALFOCUS;
     description.dwBufferBytes = static_cast<DWORD>(wavFile.audioBytes.size());
     description.lpwfxFormat = const_cast<WAVEFORMATEX*>(wavFile.Format());
-
-    if (use3D)
-    {
-        description.dwFlags |= DSBCAPS_CTRL3D;
-        description.guid3DAlgorithm = DS3DALG_DEFAULT;
-    }
 
     if (loop)
     {
@@ -367,38 +437,6 @@ ComPtr<IDirectSoundBuffer8> CreateBuffer(const WavFile& wavFile, bool use3D, boo
                   "Failed to unlock the sound buffer.");
 
     return buffer;
-}
-
-void Configure3DBuffer(IDirectSoundBuffer8& buffer,
-                       const Vector3* sourcePosition,
-                       IDirectSound3DBuffer8** outBuffer3D)
-{
-    if (outBuffer3D != nullptr)
-    {
-        *outBuffer3D = nullptr;
-    }
-
-    if (sourcePosition == nullptr)
-    {
-        return;
-    }
-
-    ComPtr<IDirectSound3DBuffer8> buffer3D;
-    ThrowIfFailed(buffer.QueryInterface(IID_IDirectSound3DBuffer8,
-                                        reinterpret_cast<void**>(buffer3D.GetAddressOf())),
-                  "Failed to query the 3D sound buffer interface.");
-
-    ThrowIfFailed(buffer3D->SetMode(DS3DMODE_NORMAL, DS3D_DEFERRED), "Failed to set the 3D mode.");
-    ThrowIfFailed(buffer3D->SetPosition(sourcePosition->x,
-                                        sourcePosition->y,
-                                        sourcePosition->z,
-                                        DS3D_DEFERRED),
-                  "Failed to set the 3D position.");
-
-    if (outBuffer3D != nullptr)
-    {
-        *outBuffer3D = buffer3D.Detach();
-    }
 }
 
 void StartBuffer(IDirectSoundBuffer8& buffer, bool loop)
@@ -480,7 +518,7 @@ void UpdateVoiceFade(Voice& voice)
     }
 
     const int currentVolume = CalculateCurrentFadeVolume(voice.fade);
-    SetBufferVolume(*voice.buffer.Get(), currentVolume, voice.effectType);
+    ApplySpatialSettings(voice, currentVolume);
 
     const DWORD elapsed = timeGetTime() - voice.fade.startedAt;
     if (elapsed < voice.fade.durationMs)
@@ -490,7 +528,7 @@ void UpdateVoiceFade(Voice& voice)
 
     voice.fade.active = false;
     voice.targetVolume = voice.fade.targetVolume;
-    SetBufferVolume(*voice.buffer.Get(), voice.targetVolume, voice.effectType);
+    ApplySpatialSettings(voice, voice.targetVolume);
 
     if (voice.fade.stopWhenDone)
     {
@@ -503,9 +541,24 @@ void UpdateEnvironmentFades()
     for (auto& voice : g_state.environmentSounds)
     {
         UpdateVoiceFade(voice);
+        if (!voice.fade.active)
+        {
+            ApplySpatialSettings(voice, voice.targetVolume);
+        }
     }
 
     RefreshFinishedVoices(g_state.environmentSounds);
+}
+
+void UpdateSoundEffectSpatialization()
+{
+    for (auto& voice : g_state.soundEffects)
+    {
+        if (!voice.fade.active)
+        {
+            ApplySpatialSettings(voice, voice.targetVolume);
+        }
+    }
 }
 
 void StopAndReleaseBgm()
@@ -693,6 +746,7 @@ void SoundLib::Update(const Vector3& listenerPosition,
     ThrowIfFailed(g_state.listener3D->CommitDeferredSettings(), "Failed to commit deferred 3D settings.");
 
     RefreshFinishedVoices(g_state.soundEffects);
+    UpdateSoundEffectSpatialization();
     UpdateEnvironmentFades();
     UpdateBgmFade();
 }
@@ -727,15 +781,16 @@ int SoundLib::PlaySoundEffect(const std::wstring& filePath,
     Voice voice {};
     voice.id = AcquireVoiceId();
     voice.targetVolume = volume;
+    voice.hasSourcePosition = (sourcePosition != nullptr);
+    if (sourcePosition != nullptr)
+    {
+        voice.sourcePosition = *sourcePosition;
+    }
     voice.effectType = effectType;
-    voice.buffer = CreateBuffer(wavFile, sourcePosition != nullptr, false);
-
-    IDirectSound3DBuffer8* raw3D = nullptr;
-    Configure3DBuffer(*voice.buffer.Get(), sourcePosition, &raw3D);
-    voice.buffer3D.Attach(raw3D);
+    voice.buffer = CreateBuffer(wavFile, false);
 
     ApplyEffectType(*voice.buffer.Get(), *wavFile.Format(), effectType);
-    SetBufferVolume(*voice.buffer.Get(), volume, effectType);
+    ApplySpatialSettings(voice, volume);
     StartBuffer(*voice.buffer.Get(), false);
 
     g_state.soundEffects.push_back(std::move(voice));
@@ -783,7 +838,7 @@ void SoundLib::PlayBgm(const std::wstring& filePath, int volume, float startSeco
 
     g_state.bgm.filePath = filePath;
     g_state.bgm.targetVolume = volume;
-    g_state.bgm.buffer = CreateBuffer(wavFile, false, true);
+    g_state.bgm.buffer = CreateBuffer(wavFile, true);
     g_state.bgm.stopRequested = false;
 
     ApplyEffectType(*g_state.bgm.buffer.Get(), *wavFile.Format(), EffectType::None);
@@ -855,15 +910,16 @@ int SoundLib::PlayEnvironmentSound(const std::wstring& filePath,
     voice.targetVolume = volume;
     voice.isLoop = loop;
     voice.isEnvironment = true;
+    voice.hasSourcePosition = (sourcePosition != nullptr);
+    if (sourcePosition != nullptr)
+    {
+        voice.sourcePosition = *sourcePosition;
+    }
     voice.effectType = effectType;
-    voice.buffer = CreateBuffer(wavFile, sourcePosition != nullptr, loop);
-
-    IDirectSound3DBuffer8* raw3D = nullptr;
-    Configure3DBuffer(*voice.buffer.Get(), sourcePosition, &raw3D);
-    voice.buffer3D.Attach(raw3D);
+    voice.buffer = CreateBuffer(wavFile, loop);
 
     ApplyEffectType(*voice.buffer.Get(), *wavFile.Format(), effectType);
-    SetBufferVolume(*voice.buffer.Get(), 0, effectType);
+    ApplySpatialSettings(voice, 0);
     StartBuffer(*voice.buffer.Get(), loop);
     BeginFade(voice.fade, 0, volume, false);
 
@@ -897,7 +953,7 @@ void SoundLib::SetEnvironmentSoundVolume(int id, int volume)
         return;
     }
 
-    SetBufferVolume(*voice.buffer.Get(), volume, voice.effectType);
+    ApplySpatialSettings(voice, volume);
 }
 
 }

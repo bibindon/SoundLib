@@ -66,6 +66,8 @@ static void Render();
 static void HandleKeyDown(WPARAM key);
 static SampleAssets DiscoverSampleAssets();
 static std::wstring FileNameOnly(const std::filesystem::path& path);
+static std::filesystem::path FindResourceDirectory();
+static std::string WideToUtf8(const std::wstring& value);
 static void UpdateListenerPosition(float deltaX, float deltaZ);
 static std::wstring BuildUiText();
 LRESULT WINAPI MsgProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam);
@@ -168,7 +170,7 @@ SampleAssets DiscoverSampleAssets()
 {
     SampleAssets assets;
     std::vector<std::pair<std::filesystem::path, uintmax_t>> nonEnvironmentSounds;
-    const std::filesystem::path baseDirectory = std::filesystem::absolute(L"..\\..\\res");
+    const std::filesystem::path baseDirectory = FindResourceDirectory();
 
     for (const auto& entry : std::filesystem::directory_iterator(baseDirectory))
     {
@@ -222,6 +224,68 @@ SampleAssets DiscoverSampleAssets()
 std::wstring FileNameOnly(const std::filesystem::path& path)
 {
     return path.filename().wstring();
+}
+
+std::filesystem::path FindResourceDirectory()
+{
+    wchar_t modulePath[MAX_PATH] {};
+    const DWORD length = GetModuleFileNameW(nullptr, modulePath, static_cast<DWORD>(std::size(modulePath)));
+    if (length == 0 || length >= std::size(modulePath))
+    {
+        throw std::runtime_error("Failed to resolve the module path.");
+    }
+
+    std::filesystem::path executablePath(modulePath);
+    std::vector<std::filesystem::path> candidates;
+    candidates.push_back(executablePath.parent_path() / L"res");
+    candidates.push_back(executablePath.parent_path().parent_path() / L"res");
+    candidates.push_back(executablePath.parent_path().parent_path().parent_path() / L"res");
+    candidates.push_back(executablePath.parent_path().parent_path().parent_path() / L"SoundLib" / L"res");
+
+    for (const auto& candidate : candidates)
+    {
+        if (std::filesystem::exists(candidate) && std::filesystem::is_directory(candidate))
+        {
+            return candidate;
+        }
+    }
+
+    std::wstringstream stream;
+    stream << L"Could not find the res directory. Last checked: "
+           << candidates.back().wstring();
+    throw std::runtime_error(WideToUtf8(stream.str()));
+}
+
+std::string WideToUtf8(const std::wstring& value)
+{
+    const int size = WideCharToMultiByte(CP_UTF8,
+                                         0,
+                                         value.c_str(),
+                                         static_cast<int>(value.size()),
+                                         nullptr,
+                                         0,
+                                         nullptr,
+                                         nullptr);
+    if (size <= 0)
+    {
+        return "WideCharToMultiByte failed.";
+    }
+
+    std::string result(static_cast<size_t>(size), '\0');
+    const int written = WideCharToMultiByte(CP_UTF8,
+                                            0,
+                                            value.c_str(),
+                                            static_cast<int>(value.size()),
+                                            result.data(),
+                                            size,
+                                            nullptr,
+                                            nullptr);
+    if (written <= 0)
+    {
+        return "WideCharToMultiByte failed.";
+    }
+
+    return result;
 }
 
 void InitAudio(HWND hWnd)
