@@ -5,6 +5,7 @@
 #pragma comment(lib, "winmm.lib")
 
 #include <dsound.h>
+#include <mmdeviceapi.h>
 #include <mmsystem.h>
 #include <wrl/client.h>
 
@@ -57,12 +58,14 @@ struct FadeState
 struct Voice
 {
     int id = -1;
+    std::wstring filePath;
     int targetVolume = 100;
     bool isLoop = false;
     bool isEnvironment = false;
     // DirectSound3D ではなく、距離減衰と左右パンで簡易的な3D表現を行う。
     bool hasSourcePosition = false;
     Vector3 sourcePosition {};
+    DWORD resumeOffsetBytes = 0;
     EffectType effectType = EffectType::None;
     ComPtr<IDirectSoundBuffer8> buffer;
     FadeState fade;
@@ -72,6 +75,7 @@ struct BgmState
 {
     std::wstring filePath;
     int targetVolume = 100;
+    DWORD resumeOffsetBytes = 0;
     ComPtr<IDirectSoundBuffer8> buffer;
     FadeState fade;
     bool stopRequested = false;
@@ -85,14 +89,17 @@ struct BgmState
 struct SoundState
 {
     bool initialized = false;
+    bool comInitialized = false;
     HWND windowHandle = nullptr;
     int nextVoiceId = 1;
+    std::wstring defaultRenderDeviceId;
     Vector3 listenerPosition {};
     Vector3 listenerFront { 0.0f, 0.0f, 1.0f };
     Vector3 listenerTop { 0.0f, 1.0f, 0.0f };
     ComPtr<IDirectSound8> directSound;
     ComPtr<IDirectSoundBuffer> primaryBuffer;
     ComPtr<IDirectSound3DListener8> listener3D;
+    ComPtr<IMMDeviceEnumerator> deviceEnumerator;
     std::unordered_map<std::wstring, WavFile> soundEffectCache;
     std::unordered_map<std::wstring, WavFile> streamedCache;
     std::vector<Voice> soundEffects;
@@ -101,6 +108,13 @@ struct SoundState
 };
 
 SoundState g_state;
+
+int CreateEnvironmentVoice(const std::wstring& filePath,
+                           int volume,
+                           const Vector3* sourcePosition,
+                           EffectType effectType,
+                           bool loop,
+                           DWORD startOffsetBytes);
 
 // HRESULT をチェックして、失敗時は例外へ変換する。
 // DirectSound は多くの API が HRESULT を返すため、
@@ -129,6 +143,32 @@ void ValidateVolume(int volume)
     {
         throw std::out_of_range("Volume must be in the range [0, 100].");
     }
+}
+
+// COM で得た文字列ポインタを std::wstring へコピーする。
+std::wstring CopyCoTaskMemString(const wchar_t* value)
+{
+    if (value == nullptr)
+    {
+        return L"";
+    }
+
+    return value;
+}
+
+// Windows の現在の既定再生デバイス ID を取得する。
+std::wstring GetDefaultRenderDeviceId()
+{
+    ComPtr<IMMDevice> device;
+    ThrowIfFailed(g_state.deviceEnumerator->GetDefaultAudioEndpoint(eRender, eConsole, &device),
+                  "Failed to get the default render device.");
+
+    LPWSTR rawId = nullptr;
+    ThrowIfFailed(device->GetId(&rawId), "Failed to get the render device ID.");
+
+    std::wstring deviceId = CopyCoTaskMemString(rawId);
+    CoTaskMemFree(rawId);
+    return deviceId;
 }
 
 // RIFF/WAV のチャンクサイズ読み取り用。
@@ -335,6 +375,28 @@ DWORD SecondsToBufferOffset(const WavFile& wavFile, float seconds)
     return offset;
 }
 
+// byte オフセットを秒へ変換する。
+float BufferOffsetToSeconds(const WavFile& wavFile, DWORD offsetBytes)
+{
+    const WAVEFORMATEX* format = wavFile.Format();
+    if (format->nAvgBytesPerSec == 0)
+    {
+        return 0.0f;
+    }
+
+    const DWORD safeOffset = std::min<DWORD>(offsetBytes, static_cast<DWORD>(wavFile.audioBytes.size()));
+    return static_cast<float>(safeOffset) / static_cast<float>(format->nAvgBytesPerSec);
+}
+
+// 現在の再生カーソル位置を取得する。
+DWORD GetCurrentPlaybackOffset(IDirectSoundBuffer8& buffer)
+{
+    DWORD playCursor = 0;
+    DWORD writeCursor = 0;
+    ThrowIfFailed(buffer.GetCurrentPosition(&playCursor, &writeCursor), "Failed to get the current playback position.");
+    return playCursor;
+}
+
 // エフェクト種別に応じた簡易音量補正。
 int ApplyEffectVolumeAdjustment(int volume, EffectType effectType)
 {
@@ -481,7 +543,7 @@ ComPtr<IDirectSoundBuffer8> CreateBuffer(const WavFile& wavFile, bool loop)
 }
 
 // 再生位置を先頭へ戻してから再生開始する。
-void StartBuffer(IDirectSoundBuffer8& buffer, bool loop)
+void StartBuffer(IDirectSoundBuffer8& buffer, bool loop, DWORD startOffsetBytes = 0)
 {
     DWORD playFlags = 0;
     if (loop)
@@ -489,7 +551,7 @@ void StartBuffer(IDirectSoundBuffer8& buffer, bool loop)
         playFlags = DSBPLAY_LOOPING;
     }
 
-    ThrowIfFailed(buffer.SetCurrentPosition(0), "Failed to reset the play cursor.");
+    ThrowIfFailed(buffer.SetCurrentPosition(startOffsetBytes), "Failed to set the play cursor.");
     ThrowIfFailed(buffer.Play(0, 0, playFlags), "Failed to start the buffer.");
 }
 
@@ -631,6 +693,7 @@ void StopAndReleaseBgm()
     }
 
     g_state.bgm.filePath.clear();
+    g_state.bgm.resumeOffsetBytes = 0;
     g_state.bgm.fade = {};
     g_state.bgm.stopRequested = false;
 }
@@ -717,6 +780,168 @@ void ConfigurePrimaryBuffer()
     ThrowIfFailed(g_state.listener3D->SetDopplerFactor(1.0f, DS3D_IMMEDIATE), "Failed to set the listener doppler factor.");
 }
 
+// DirectSound デバイスと primary buffer を作り直す。
+void CreateDirectSoundDevice()
+{
+    g_state.listener3D.Reset();
+    g_state.primaryBuffer.Reset();
+    g_state.directSound.Reset();
+
+    ThrowIfFailed(DirectSoundCreate8(nullptr, g_state.directSound.GetAddressOf(), nullptr),
+                  "Failed to create DirectSound8.");
+    ThrowIfFailed(g_state.directSound->SetCooperativeLevel(g_state.windowHandle, DSSCL_PRIORITY),
+                  "Failed to set the cooperative level.");
+
+    ConfigurePrimaryBuffer();
+}
+
+// 現在の再生状態を保持したまま、出力デバイス切り替え後の DirectSound を再構築する。
+void RebuildAudioDevice()
+{
+    std::vector<Voice> environmentsToRestore;
+    environmentsToRestore.reserve(g_state.environmentSounds.size());
+    for (const auto& voice : g_state.environmentSounds)
+    {
+        if (voice.fade.active && voice.fade.stopWhenDone)
+        {
+            continue;
+        }
+
+        Voice copiedVoice = voice;
+        if (voice.buffer)
+        {
+            copiedVoice.resumeOffsetBytes = GetCurrentPlaybackOffset(*voice.buffer.Get());
+        }
+        environmentsToRestore.push_back(std::move(copiedVoice));
+    }
+
+    bool restoreBgm = false;
+    if ((g_state.bgm.buffer != nullptr) && !g_state.bgm.filePath.empty())
+    {
+        restoreBgm = true;
+        if (g_state.bgm.fade.active && g_state.bgm.fade.stopWhenDone)
+        {
+            restoreBgm = false;
+        }
+    }
+    const std::wstring bgmPath = g_state.bgm.filePath;
+    const int bgmVolume = g_state.bgm.targetVolume;
+    DWORD bgmResumeOffsetBytes = 0;
+    if (restoreBgm && g_state.bgm.buffer)
+    {
+        bgmResumeOffsetBytes = GetCurrentPlaybackOffset(*g_state.bgm.buffer.Get());
+    }
+
+    for (auto& voice : g_state.soundEffects)
+    {
+        if (voice.buffer)
+        {
+            voice.buffer->Stop();
+        }
+    }
+
+    for (auto& voice : g_state.environmentSounds)
+    {
+        if (voice.buffer)
+        {
+            voice.buffer->Stop();
+        }
+    }
+
+    if (g_state.bgm.buffer)
+    {
+        g_state.bgm.buffer->Stop();
+    }
+
+    g_state.soundEffects.clear();
+    g_state.environmentSounds.clear();
+    g_state.bgm.buffer.Reset();
+    g_state.bgm.fade = {};
+    g_state.bgm.filePath.clear();
+    g_state.bgm.hasPendingPlay = false;
+    g_state.bgm.pendingFilePath.clear();
+
+    CreateDirectSoundDevice();
+    g_state.defaultRenderDeviceId = GetDefaultRenderDeviceId();
+
+    if (restoreBgm)
+    {
+        WavFile& bgmWave = GetStreamedWave(bgmPath);
+        const float bgmStartSeconds = BufferOffsetToSeconds(bgmWave, bgmResumeOffsetBytes);
+        SoundLib::SoundLib::PlayBgm(bgmPath, bgmVolume, bgmStartSeconds);
+    }
+
+    for (const auto& voice : environmentsToRestore)
+    {
+        const Vector3* position = nullptr;
+        Vector3 copiedPosition {};
+        if (voice.hasSourcePosition)
+        {
+            copiedPosition = voice.sourcePosition;
+            position = &copiedPosition;
+        }
+
+        CreateEnvironmentVoice(voice.filePath,
+                               voice.targetVolume,
+                               position,
+                               voice.effectType,
+                               voice.isLoop,
+                               voice.resumeOffsetBytes);
+    }
+}
+
+// 既定再生デバイスが変わったかどうかを調べ、変わっていれば再構築する。
+void RefreshDeviceIfNeeded()
+{
+    const std::wstring currentDeviceId = GetDefaultRenderDeviceId();
+    if (currentDeviceId == g_state.defaultRenderDeviceId)
+    {
+        return;
+    }
+
+    RebuildAudioDevice();
+}
+
+// 環境音1本ぶんの再生インスタンスを作る共通処理。
+int CreateEnvironmentVoice(const std::wstring& filePath,
+                           int volume,
+                           const Vector3* sourcePosition,
+                           EffectType effectType,
+                           bool loop,
+                           DWORD startOffsetBytes)
+{
+    RefreshFinishedVoices(g_state.environmentSounds);
+    if (g_state.environmentSounds.size() >= kMaxSimultaneousEnvironmentSounds)
+    {
+        throw std::runtime_error("The environment sound voice limit was exceeded.");
+    }
+
+    WavFile& wavFile = GetStreamedWave(filePath);
+
+    Voice voice {};
+    voice.id = AcquireVoiceId();
+    voice.filePath = filePath;
+    voice.targetVolume = volume;
+    voice.isLoop = loop;
+    voice.isEnvironment = true;
+    voice.resumeOffsetBytes = startOffsetBytes;
+    voice.hasSourcePosition = (sourcePosition != nullptr);
+    if (sourcePosition != nullptr)
+    {
+        voice.sourcePosition = *sourcePosition;
+    }
+    voice.effectType = effectType;
+    voice.buffer = CreateBuffer(wavFile, loop);
+
+    ApplyEffectType(*voice.buffer.Get(), *wavFile.Format(), effectType);
+    ApplySpatialSettings(voice, 0);
+    StartBuffer(*voice.buffer.Get(), loop, startOffsetBytes);
+    BeginFade(voice.fade, 0, volume, false);
+
+    g_state.environmentSounds.push_back(std::move(voice));
+    return g_state.environmentSounds.back().id;
+}
+
 template <typename T>
 void ResetContainer(T& container)
 {
@@ -740,13 +965,24 @@ void SoundLib::Initialize(HWND windowHandle)
     }
 
     g_state.windowHandle = windowHandle;
+    const HRESULT comResult = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
+    if (SUCCEEDED(comResult))
+    {
+        g_state.comInitialized = true;
+    }
+    else if (comResult != RPC_E_CHANGED_MODE)
+    {
+        ThrowIfFailed(comResult, "Failed to initialize COM.");
+    }
 
-    ThrowIfFailed(DirectSoundCreate8(nullptr, g_state.directSound.GetAddressOf(), nullptr),
-                  "Failed to create DirectSound8.");
-    ThrowIfFailed(g_state.directSound->SetCooperativeLevel(windowHandle, DSSCL_PRIORITY),
-                  "Failed to set the cooperative level.");
+    ThrowIfFailed(CoCreateInstance(__uuidof(MMDeviceEnumerator),
+                                   nullptr,
+                                   CLSCTX_ALL,
+                                   IID_PPV_ARGS(g_state.deviceEnumerator.GetAddressOf())),
+                  "Failed to create the MMDeviceEnumerator.");
 
-    ConfigurePrimaryBuffer();
+    g_state.defaultRenderDeviceId = GetDefaultRenderDeviceId();
+    CreateDirectSoundDevice();
 
     g_state.soundEffects.reserve(kMaxSimultaneousSoundEffects);
     g_state.environmentSounds.reserve(kMaxSimultaneousEnvironmentSounds);
@@ -782,9 +1018,16 @@ void SoundLib::Finalize()
     ResetContainer(g_state.environmentSounds);
     ResetContainer(g_state.soundEffectCache);
     ResetContainer(g_state.streamedCache);
+    g_state.deviceEnumerator.Reset();
     g_state.listener3D.Reset();
     g_state.primaryBuffer.Reset();
     g_state.directSound.Reset();
+    g_state.defaultRenderDeviceId.clear();
+    if (g_state.comInitialized)
+    {
+        CoUninitialize();
+        g_state.comInitialized = false;
+    }
     g_state.initialized = false;
     g_state.windowHandle = nullptr;
     g_state.nextVoiceId = 1;
@@ -801,6 +1044,8 @@ void SoundLib::Update(const Vector3& listenerPosition,
     g_state.listenerPosition = listenerPosition;
     g_state.listenerFront = listenerFront;
     g_state.listenerTop = listenerTop;
+
+    RefreshDeviceIfNeeded();
 
     ThrowIfFailed(g_state.listener3D->SetPosition(listenerPosition.x,
                                                   listenerPosition.y,
@@ -854,6 +1099,7 @@ int SoundLib::PlaySoundEffect(const std::wstring& filePath,
     const WavFile& wavFile = cacheIterator->second;
     Voice voice {};
     voice.id = AcquireVoiceId();
+    voice.filePath = filePath;
     voice.targetVolume = volume;
     voice.hasSourcePosition = (sourcePosition != nullptr);
     if (sourcePosition != nullptr)
@@ -919,6 +1165,7 @@ void SoundLib::PlayBgm(const std::wstring& filePath, int volume, float startSeco
 
     g_state.bgm.filePath = filePath;
     g_state.bgm.targetVolume = volume;
+    g_state.bgm.resumeOffsetBytes = 0;
     // BGM は1本だけをループ再生する。
     g_state.bgm.buffer = CreateBuffer(wavFile, true);
     g_state.bgm.stopRequested = false;
@@ -984,35 +1231,7 @@ int SoundLib::PlayEnvironmentSound(const std::wstring& filePath,
     EnsureInitialized();
     ValidateVolume(volume);
 
-    RefreshFinishedVoices(g_state.environmentSounds);
-    if (g_state.environmentSounds.size() >= kMaxSimultaneousEnvironmentSounds)
-    {
-        throw std::runtime_error("The environment sound voice limit was exceeded.");
-    }
-
-    WavFile& wavFile = GetStreamedWave(filePath);
-
-    Voice voice {};
-    voice.id = AcquireVoiceId();
-    voice.targetVolume = volume;
-    voice.isLoop = loop;
-    voice.isEnvironment = true;
-    voice.hasSourcePosition = (sourcePosition != nullptr);
-    if (sourcePosition != nullptr)
-    {
-        voice.sourcePosition = *sourcePosition;
-    }
-    voice.effectType = effectType;
-    // 環境音も効果音と同様に voice 単位で個別バッファを持つ。
-    voice.buffer = CreateBuffer(wavFile, loop);
-
-    ApplyEffectType(*voice.buffer.Get(), *wavFile.Format(), effectType);
-    ApplySpatialSettings(voice, 0);
-    StartBuffer(*voice.buffer.Get(), loop);
-    BeginFade(voice.fade, 0, volume, false);
-
-    g_state.environmentSounds.push_back(std::move(voice));
-    return g_state.environmentSounds.back().id;
+    return CreateEnvironmentVoice(filePath, volume, sourcePosition, effectType, loop, 0);
 }
 
 void SoundLib::StopEnvironmentSound(int id)
