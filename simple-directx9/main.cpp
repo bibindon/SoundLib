@@ -1,4 +1,8 @@
-﻿#pragma comment( lib, "d3d9.lib" )
+﻿#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+
+#pragma comment( lib, "d3d9.lib" )
 #if defined(DEBUG) || defined(_DEBUG)
 #pragma comment( lib, "d3dx9d.lib" )
 #else
@@ -7,11 +11,18 @@
 
 #include <d3d9.h>
 #include <d3dx9.h>
-#include <string>
 #include <tchar.h>
+
+#include <algorithm>
 #include <cassert>
 #include <crtdbg.h>
+#include <cstring>
+#include <filesystem>
+#include <sstream>
+#include <string>
 #include <vector>
+
+#include "..\SoundLib\SoundLib.h"
 
 #define SAFE_RELEASE(p) { if (p) { (p)->Release(); (p) = NULL; } }
 
@@ -28,10 +39,35 @@ DWORD g_dwNumMaterials = 0;
 LPD3DXEFFECT g_pEffect = NULL;
 bool g_bClose = false;
 
-static void TextDraw(LPD3DXFONT pFont, TCHAR* text, int X, int Y);
+struct SampleAssets
+{
+    std::vector<std::filesystem::path> soundEffects;
+    std::vector<std::filesystem::path> bgms;
+    std::vector<std::filesystem::path> environments;
+};
+
+SampleAssets g_assets;
+std::wstring g_audioError;
+std::wstring g_statusMessage = L"Ready";
+SoundLib::Vector3 g_listenerPosition { 0.0f, 3.0f, -18.0f };
+SoundLib::Vector3 g_listenerFront { 0.0f, 0.0f, 1.0f };
+SoundLib::Vector3 g_listenerTop { 0.0f, 1.0f, 0.0f };
+bool g_isBgmPlaying = false;
+size_t g_bgmIndex = 0;
+int g_bgmVolume = 75;
+int g_leftEnvironmentId = -1;
+int g_rightEnvironmentId = -1;
+
+static void TextDraw(LPD3DXFONT pFont, const TCHAR* text, int x, int y);
 static void InitD3D(HWND hWnd);
+static void InitAudio(HWND hWnd);
 static void Cleanup();
 static void Render();
+static void HandleKeyDown(WPARAM key);
+static SampleAssets DiscoverSampleAssets();
+static std::wstring FileNameOnly(const std::filesystem::path& path);
+static void UpdateListenerPosition(float deltaX, float deltaZ);
+static std::wstring BuildUiText();
 LRESULT WINAPI MsgProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam);
 
 extern int WINAPI _tWinMain(_In_ HINSTANCE hInstance,
@@ -72,7 +108,7 @@ int WINAPI _tWinMain(_In_ HINSTANCE hInstance,
     rect.left = 0;
 
     HWND hWnd = CreateWindow(_T("Window1"),
-                             _T("Hello DirectX9 World !!"),
+                             _T("SoundLib Sample"),
                              WS_OVERLAPPEDWINDOW,
                              CW_USEDEFAULT,
                              CW_USEDEFAULT,
@@ -84,6 +120,7 @@ int WINAPI _tWinMain(_In_ HINSTANCE hInstance,
                              NULL);
 
     InitD3D(hWnd);
+    InitAudio(hWnd);
     ShowWindow(hWnd, SW_SHOWDEFAULT);
     UpdateWindow(hWnd);
 
@@ -113,12 +150,10 @@ int WINAPI _tWinMain(_In_ HINSTANCE hInstance,
     return 0;
 }
 
-void TextDraw(LPD3DXFONT pFont, TCHAR* text, int X, int Y)
+void TextDraw(LPD3DXFONT pFont, const TCHAR* text, int x, int y)
 {
-    RECT rect = { X, Y, 0, 0 };
+    RECT rect = { x, y, 0, 0 };
 
-    // DrawTextの戻り値は文字数である。
-    // そのため、hResultの中身が整数でもエラーが起きているわけではない。
     HRESULT hResult = pFont->DrawText(NULL,
                                       text,
                                       -1,
@@ -127,6 +162,90 @@ void TextDraw(LPD3DXFONT pFont, TCHAR* text, int X, int Y)
                                       D3DCOLOR_ARGB(255, 0, 0, 0));
 
     assert((int)hResult >= 0);
+}
+
+SampleAssets DiscoverSampleAssets()
+{
+    SampleAssets assets;
+    std::vector<std::pair<std::filesystem::path, uintmax_t>> nonEnvironmentSounds;
+    const std::filesystem::path baseDirectory = std::filesystem::absolute(L"..\\..\\res");
+
+    for (const auto& entry : std::filesystem::directory_iterator(baseDirectory))
+    {
+        if (!entry.is_regular_file() || entry.path().extension() != L".wav")
+        {
+            continue;
+        }
+
+        const std::wstring fileName = entry.path().filename().wstring();
+        const uintmax_t fileSize = entry.file_size();
+
+        if (fileName.find(L"ENV") != std::wstring::npos)
+        {
+            assets.environments.push_back(entry.path());
+        }
+        else
+        {
+            nonEnvironmentSounds.emplace_back(entry.path(), fileSize);
+        }
+    }
+
+    std::sort(assets.environments.begin(), assets.environments.end());
+
+    std::sort(nonEnvironmentSounds.begin(),
+              nonEnvironmentSounds.end(),
+              [](const auto& left, const auto& right)
+              {
+                  return left.second < right.second;
+              });
+
+    for (size_t i = 0; i < std::min<size_t>(3, nonEnvironmentSounds.size()); ++i)
+    {
+        assets.soundEffects.push_back(nonEnvironmentSounds[i].first);
+    }
+
+    std::sort(nonEnvironmentSounds.begin(),
+              nonEnvironmentSounds.end(),
+              [](const auto& left, const auto& right)
+              {
+                  return left.second > right.second;
+              });
+
+    for (size_t i = 0; i < std::min<size_t>(3, nonEnvironmentSounds.size()); ++i)
+    {
+        assets.bgms.push_back(nonEnvironmentSounds[i].first);
+    }
+
+    return assets;
+}
+
+std::wstring FileNameOnly(const std::filesystem::path& path)
+{
+    return path.filename().wstring();
+}
+
+void InitAudio(HWND hWnd)
+{
+    try
+    {
+        g_assets = DiscoverSampleAssets();
+        SoundLib::SoundLib::Initialize(hWnd);
+
+        for (const auto& soundEffect : g_assets.soundEffects)
+        {
+            SoundLib::SoundLib::LoadSoundEffect(soundEffect.wstring());
+        }
+
+        std::wstringstream stream;
+        stream << L"Loaded " << g_assets.soundEffects.size() << L" SE / "
+               << g_assets.bgms.size() << L" BGM / "
+               << g_assets.environments.size() << L" ENV";
+        g_statusMessage = stream.str();
+    }
+    catch (const std::exception& exception)
+    {
+        g_audioError = std::wstring(L"Audio init failed: ") + std::wstring(exception.what(), exception.what() + std::strlen(exception.what()));
+    }
 }
 
 void InitD3D(HWND hWnd)
@@ -207,39 +326,21 @@ void InitD3D(HWND hWnd)
         g_pMaterials[i] = d3dxMaterials[i].MatD3D;
         g_pMaterials[i].Ambient = g_pMaterials[i].Diffuse;
         g_pTextures[i] = NULL;
-        
-        //--------------------------------------------------------------
-        // Unicode文字セットでもマルチバイト文字セットでも
-        // "d3dxMaterials[i].pTextureFilename"はマルチバイト文字セットになる。
-        // 
-        // 一方で、D3DXCreateTextureFromFileはプロジェクト設定で
-        // Unicode文字セットかマルチバイト文字セットか変わる。
-        //--------------------------------------------------------------
 
         std::string pTexPath(d3dxMaterials[i].pTextureFilename);
 
         if (!pTexPath.empty())
         {
-            bool bUnicode = false;
-
 #ifdef UNICODE
-            bUnicode = true;
+            int len = MultiByteToWideChar(CP_ACP, 0, pTexPath.c_str(), -1, nullptr, 0);
+            std::wstring pTexPathW(len, 0);
+            MultiByteToWideChar(CP_ACP, 0, pTexPath.c_str(), -1, &pTexPathW[0], len);
+
+            hResult = D3DXCreateTextureFromFileW(g_pd3dDevice, pTexPathW.c_str(), &g_pTextures[i]);
+#else
+            hResult = D3DXCreateTextureFromFileA(g_pd3dDevice, pTexPath.c_str(), &g_pTextures[i]);
 #endif
-
-            if (!bUnicode)
-            {
-                hResult = D3DXCreateTextureFromFileA(g_pd3dDevice, pTexPath.c_str(), &g_pTextures[i]);
-                assert(hResult == S_OK);
-            }
-            else
-            {
-                int len = MultiByteToWideChar(CP_ACP, 0, pTexPath.c_str(), -1, nullptr, 0);
-                std::wstring pTexPathW(len, 0);
-                MultiByteToWideChar(CP_ACP, 0, pTexPath.c_str(), -1, &pTexPathW[0], len);
-
-                hResult = D3DXCreateTextureFromFileW(g_pd3dDevice, pTexPathW.c_str(), &g_pTextures[i]);
-                assert(hResult == S_OK);
-            }
+            assert(hResult == S_OK);
         }
     }
 
@@ -260,6 +361,36 @@ void InitD3D(HWND hWnd)
 
 void Cleanup()
 {
+    if (g_leftEnvironmentId >= 0)
+    {
+        try
+        {
+            SoundLib::SoundLib::StopEnvironmentSound(g_leftEnvironmentId);
+        }
+        catch (...)
+        {
+        }
+    }
+
+    if (g_rightEnvironmentId >= 0)
+    {
+        try
+        {
+            SoundLib::SoundLib::StopEnvironmentSound(g_rightEnvironmentId);
+        }
+        catch (...)
+        {
+        }
+    }
+
+    try
+    {
+        SoundLib::SoundLib::Finalize();
+    }
+    catch (...)
+    {
+    }
+
     for (auto& texture : g_pTextures)
     {
         SAFE_RELEASE(texture);
@@ -270,6 +401,210 @@ void Cleanup()
     SAFE_RELEASE(g_pFont);
     SAFE_RELEASE(g_pd3dDevice);
     SAFE_RELEASE(g_pD3D);
+}
+
+void UpdateListenerPosition(float deltaX, float deltaZ)
+{
+    g_listenerPosition.x += deltaX;
+    g_listenerPosition.z += deltaZ;
+
+    std::wstringstream stream;
+    stream << L"Listener moved to (" << g_listenerPosition.x << L", "
+           << g_listenerPosition.y << L", " << g_listenerPosition.z << L")";
+    g_statusMessage = stream.str();
+}
+
+void HandleKeyDown(WPARAM key)
+{
+    if (!g_audioError.empty())
+    {
+        return;
+    }
+
+    try
+    {
+        switch (key)
+        {
+        case '1':
+            if (!g_assets.soundEffects.empty())
+            {
+                SoundLib::SoundLib::PlaySoundEffect(g_assets.soundEffects[0].wstring(), 90);
+                g_statusMessage = L"Played the smallest wav as SE.";
+            }
+            break;
+        case '2':
+            if (!g_assets.soundEffects.empty())
+            {
+                for (int i = 0; i < 5; ++i)
+                {
+                    const float x = -8.0f + static_cast<float>(i) * 4.0f;
+                    SoundLib::Vector3 position { x, 0.0f, 8.0f + static_cast<float>(i) };
+                    SoundLib::SoundLib::PlaySoundEffect(g_assets.soundEffects[0].wstring(),
+                                                        80,
+                                                        &position,
+                                                        (i % 2 == 0) ? SoundLib::EffectType::None : SoundLib::EffectType::Radio);
+                }
+
+                g_statusMessage = L"Played 5 simultaneous sound effects.";
+            }
+            break;
+        case '3':
+            if (g_assets.soundEffects.size() >= 2)
+            {
+                SoundLib::Vector3 position { 10.0f, 0.0f, 4.0f };
+                SoundLib::SoundLib::PlaySoundEffect(g_assets.soundEffects[1].wstring(),
+                                                    85,
+                                                    &position,
+                                                    SoundLib::EffectType::Muffle);
+                g_statusMessage = L"Played the second SE with 3D + muffle.";
+            }
+            break;
+        case 'B':
+            if (!g_assets.bgms.empty())
+            {
+                if (g_isBgmPlaying)
+                {
+                    SoundLib::SoundLib::StopBgm();
+                    g_isBgmPlaying = false;
+                    g_statusMessage = L"Stopped BGM with fade-out.";
+                }
+                else
+                {
+                    SoundLib::SoundLib::PlayBgm(g_assets.bgms[g_bgmIndex].wstring(), g_bgmVolume);
+                    g_isBgmPlaying = true;
+                    g_statusMessage = L"Started BGM with fade-in.";
+                }
+            }
+            break;
+        case 'N':
+            if (!g_assets.bgms.empty())
+            {
+                g_bgmIndex = (g_bgmIndex + 1) % g_assets.bgms.size();
+                SoundLib::SoundLib::PlayBgm(g_assets.bgms[g_bgmIndex].wstring(), g_bgmVolume);
+                g_isBgmPlaying = true;
+                g_statusMessage = L"Requested a different BGM.";
+            }
+            break;
+        case 'E':
+            if (!g_assets.environments.empty())
+            {
+                if (g_leftEnvironmentId >= 0)
+                {
+                    SoundLib::SoundLib::StopEnvironmentSound(g_leftEnvironmentId);
+                    g_leftEnvironmentId = -1;
+                    g_statusMessage = L"Stopped the left environment sound.";
+                }
+                else
+                {
+                    SoundLib::Vector3 position { -15.0f, 0.0f, 8.0f };
+                    g_leftEnvironmentId = SoundLib::SoundLib::PlayEnvironmentSound(g_assets.environments[0].wstring(),
+                                                                                     70,
+                                                                                     &position,
+                                                                                     SoundLib::EffectType::Cave,
+                                                                                     true);
+                    g_statusMessage = L"Started the left environment sound.";
+                }
+            }
+            break;
+        case 'R':
+            if (g_assets.environments.size() >= 2)
+            {
+                if (g_rightEnvironmentId >= 0)
+                {
+                    SoundLib::SoundLib::StopEnvironmentSound(g_rightEnvironmentId);
+                    g_rightEnvironmentId = -1;
+                    g_statusMessage = L"Stopped the right environment sound.";
+                }
+                else
+                {
+                    SoundLib::Vector3 position { 15.0f, 0.0f, 8.0f };
+                    g_rightEnvironmentId = SoundLib::SoundLib::PlayEnvironmentSound(g_assets.environments[1].wstring(),
+                                                                                      70,
+                                                                                      &position,
+                                                                                      SoundLib::EffectType::Radio,
+                                                                                      true);
+                    g_statusMessage = L"Started the right environment sound.";
+                }
+            }
+            break;
+        case VK_LEFT:
+            UpdateListenerPosition(-1.0f, 0.0f);
+            break;
+        case VK_RIGHT:
+            UpdateListenerPosition(1.0f, 0.0f);
+            break;
+        case VK_UP:
+            UpdateListenerPosition(0.0f, 1.0f);
+            break;
+        case VK_DOWN:
+            UpdateListenerPosition(0.0f, -1.0f);
+            break;
+        case VK_OEM_PLUS:
+        case VK_ADD:
+            g_bgmVolume = std::min(100, g_bgmVolume + 5);
+            SoundLib::SoundLib::SetBgmVolume(g_bgmVolume);
+            g_statusMessage = L"Raised the BGM volume.";
+            break;
+        case VK_OEM_MINUS:
+        case VK_SUBTRACT:
+            g_bgmVolume = std::max(0, g_bgmVolume - 5);
+            SoundLib::SoundLib::SetBgmVolume(g_bgmVolume);
+            g_statusMessage = L"Lowered the BGM volume.";
+            break;
+        default:
+            break;
+        }
+    }
+    catch (const std::exception& exception)
+    {
+        g_audioError = std::wstring(L"Audio error: ") + std::wstring(exception.what(), exception.what() + std::strlen(exception.what()));
+    }
+}
+
+std::wstring BuildUiText()
+{
+    std::wstringstream stream;
+    stream << L"SoundLib sample controls\n";
+    stream << L"1: Play SE  2: Play 5 simultaneous SE  3: Play 3D SE\n";
+    stream << L"B: Toggle BGM  N: Next BGM  +/-: BGM volume (" << g_bgmVolume << L")\n";
+    stream << L"E: Toggle left ENV  R: Toggle right ENV\n";
+    stream << L"Arrow keys: Move listener\n\n";
+
+    if (!g_assets.soundEffects.empty())
+    {
+        stream << L"SE1: " << FileNameOnly(g_assets.soundEffects[0]) << L"\n";
+    }
+
+    if (g_assets.soundEffects.size() >= 2)
+    {
+        stream << L"SE2: " << FileNameOnly(g_assets.soundEffects[1]) << L"\n";
+    }
+
+    if (!g_assets.bgms.empty())
+    {
+        stream << L"BGM: " << FileNameOnly(g_assets.bgms[g_bgmIndex]) << L"\n";
+    }
+
+    if (!g_assets.environments.empty())
+    {
+        stream << L"ENV-L: " << FileNameOnly(g_assets.environments[0]) << L"\n";
+    }
+
+    if (g_assets.environments.size() >= 2)
+    {
+        stream << L"ENV-R: " << FileNameOnly(g_assets.environments[1]) << L"\n";
+    }
+
+    stream << L"\nListener: (" << g_listenerPosition.x << L", "
+           << g_listenerPosition.y << L", " << g_listenerPosition.z << L")\n";
+    stream << L"Status: " << g_statusMessage << L"\n";
+
+    if (!g_audioError.empty())
+    {
+        stream << L"Error: " << g_audioError << L"\n";
+    }
+
+    return stream.str();
 }
 
 void Render()
@@ -288,12 +623,31 @@ void Render()
                                1.0f,
                                10000.0f);
 
-    D3DXVECTOR3 vec1(10 * sinf(f), 10, -10 * cosf(f));
-    D3DXVECTOR3 vec2(0, 0, 0);
-    D3DXVECTOR3 vec3(0, 1, 0);
-    D3DXMatrixLookAtLH(&View, &vec1, &vec2, &vec3);
+    D3DXVECTOR3 eye(g_listenerPosition.x, g_listenerPosition.y, g_listenerPosition.z);
+    D3DXVECTOR3 target(g_listenerPosition.x + 10.0f * sinf(f),
+                       g_listenerPosition.y,
+                       g_listenerPosition.z + 10.0f * cosf(f));
+    D3DXVECTOR3 up(0, 1, 0);
+    D3DXMatrixLookAtLH(&View, &eye, &target, &up);
     D3DXMatrixIdentity(&mat);
     mat = mat * View * Proj;
+
+    D3DXVECTOR3 forward = target - eye;
+    D3DXVec3Normalize(&forward, &forward);
+    g_listenerFront = { forward.x, forward.y, forward.z };
+    g_listenerTop = { up.x, up.y, up.z };
+
+    if (g_audioError.empty())
+    {
+        try
+        {
+            SoundLib::SoundLib::Update(g_listenerPosition, g_listenerFront, g_listenerTop);
+        }
+        catch (const std::exception& exception)
+        {
+            g_audioError = std::wstring(L"Audio update error: ") + std::wstring(exception.what(), exception.what() + std::strlen(exception.what()));
+        }
+    }
 
     hResult = g_pEffect->SetMatrix("g_matWorldViewProj", &mat);
     assert(hResult == S_OK);
@@ -310,9 +664,8 @@ void Render()
     hResult = g_pd3dDevice->BeginScene();
     assert(hResult == S_OK);
 
-    TCHAR msg[100];
-    _tcscpy_s(msg, 100, _T("Xファイルの読み込みと表示"));
-    TextDraw(g_pFont, msg, 0, 0);
+    const std::wstring uiText = BuildUiText();
+    TextDraw(g_pFont, uiText.c_str(), 0, 0);
 
     hResult = g_pEffect->SetTechnique("Technique1");
     assert(hResult == S_OK);
@@ -353,14 +706,15 @@ LRESULT WINAPI MsgProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam)
 {
     switch (msg)
     {
+    case WM_KEYDOWN:
+        HandleKeyDown(wParam);
+        return 0;
+
     case WM_DESTROY:
-    {
         PostQuitMessage(0);
         g_bClose = true;
         return 0;
     }
-    }
 
     return DefWindowProc(hWnd, msg, wParam, lParam);
 }
-

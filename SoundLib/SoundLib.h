@@ -56,15 +56,61 @@
 
 #pragma once
 
-#include <deque>
-#include <map>
-#include <vector>
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+
+#include <Windows.h>
+
+#include <string>
 
 namespace SoundLib
 {
 
+struct Vector3
+{
+    float x = 0.0f;
+    float y = 0.0f;
+    float z = 0.0f;
+};
+
+enum class EffectType
+{
+    None,
+    Muffle,
+    Radio,
+    Cave
+};
+
 class SoundLib
-{};
+{
+public:
+    static void Initialize(HWND windowHandle);
+    static void Finalize();
+    static void Update(const Vector3& listenerPosition,
+                       const Vector3& listenerFront,
+                       const Vector3& listenerTop);
+
+    static void LoadSoundEffect(const std::wstring& filePath);
+    static int PlaySoundEffect(const std::wstring& filePath,
+                               int volume = 100,
+                               const Vector3* sourcePosition = nullptr,
+                               EffectType effectType = EffectType::None);
+    static void StopSoundEffect(int id);
+
+    static void PlayBgm(const std::wstring& filePath,
+                        int volume = 100,
+                        float startSeconds = 0.0f);
+    static void StopBgm();
+    static void SetBgmVolume(int volume);
+
+    static int PlayEnvironmentSound(const std::wstring& filePath,
+                                    int volume = 100,
+                                    const Vector3* sourcePosition = nullptr,
+                                    EffectType effectType = EffectType::None,
+                                    bool loop = true);
+    static void StopEnvironmentSound(int id);
+    static void SetEnvironmentSoundVolume(int id, int volume);
+};
 
 }
-
