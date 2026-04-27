@@ -483,8 +483,14 @@ ComPtr<IDirectSoundBuffer8> CreateBuffer(const WavFile& wavFile, bool loop)
 // 再生位置を先頭へ戻してから再生開始する。
 void StartBuffer(IDirectSoundBuffer8& buffer, bool loop)
 {
+    DWORD playFlags = 0;
+    if (loop)
+    {
+        playFlags = DSBPLAY_LOOPING;
+    }
+
     ThrowIfFailed(buffer.SetCurrentPosition(0), "Failed to reset the play cursor.");
-    ThrowIfFailed(buffer.Play(0, 0, loop ? DSBPLAY_LOOPING : 0), "Failed to start the buffer.");
+    ThrowIfFailed(buffer.Play(0, 0, playFlags), "Failed to start the buffer.");
 }
 
 // 再生済みの voice を一覧から回収する。
@@ -900,9 +906,11 @@ void SoundLib::PlayBgm(const std::wstring& filePath, int volume, float startSeco
         g_state.bgm.pendingStartSeconds = startSeconds;
         g_state.bgm.hasPendingPlay = true;
 
-        const int fadeStartVolume = g_state.bgm.fade.active ?
-            CalculateCurrentFadeVolume(g_state.bgm.fade) :
-            g_state.bgm.targetVolume;
+        int fadeStartVolume = g_state.bgm.targetVolume;
+        if (g_state.bgm.fade.active)
+        {
+            fadeStartVolume = CalculateCurrentFadeVolume(g_state.bgm.fade);
+        }
         BeginFade(g_state.bgm.fade, fadeStartVolume, 0, true);
         return;
     }
@@ -934,9 +942,11 @@ void SoundLib::StopBgm()
         return;
     }
 
-    const int fadeStartVolume = g_state.bgm.fade.active ?
-        CalculateCurrentFadeVolume(g_state.bgm.fade) :
-        g_state.bgm.targetVolume;
+    int fadeStartVolume = g_state.bgm.targetVolume;
+    if (g_state.bgm.fade.active)
+    {
+        fadeStartVolume = CalculateCurrentFadeVolume(g_state.bgm.fade);
+    }
     g_state.bgm.hasPendingPlay = false;
     BeginFade(g_state.bgm.fade, fadeStartVolume, 0, true);
 }
@@ -1011,9 +1021,11 @@ void SoundLib::StopEnvironmentSound(int id)
     EnsureInitialized();
 
     Voice& voice = FindVoiceById(g_state.environmentSounds, id);
-    const int fadeStartVolume = voice.fade.active ?
-        CalculateCurrentFadeVolume(voice.fade) :
-        voice.targetVolume;
+    int fadeStartVolume = voice.targetVolume;
+    if (voice.fade.active)
+    {
+        fadeStartVolume = CalculateCurrentFadeVolume(voice.fade);
+    }
     BeginFade(voice.fade, fadeStartVolume, 0, true);
 }
 

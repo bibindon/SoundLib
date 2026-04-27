@@ -503,10 +503,16 @@ void HandleKeyDown(WPARAM key)
                 {
                     const float x = -8.0f + static_cast<float>(i) * 4.0f;
                     SoundLib::Vector3 position { x, 0.0f, 8.0f + static_cast<float>(i) };
+                    SoundLib::EffectType effectType = SoundLib::EffectType::Radio;
+                    if ((i % 2) == 0)
+                    {
+                        effectType = SoundLib::EffectType::None;
+                    }
+
                     SoundLib::SoundLib::PlaySoundEffect(g_assets.soundEffects[0].wstring(),
                                                         80,
                                                         &position,
-                                                        (i % 2 == 0) ? SoundLib::EffectType::None : SoundLib::EffectType::Radio);
+                                                        effectType);
                 }
 
                 g_statusMessage = L"Played 5 simultaneous sound effects.";
