@@ -76,40 +76,74 @@ struct Vector3
 
 enum class EffectType
 {
+    // 加工なし。
     None,
+    // 少しこもった音に寄せる。
     Muffle,
+    // 無線っぽい軽い加工に寄せる。
     Radio,
+    // 反響感のある少し鈍い音に寄せる。
     Cave
 };
 
 class SoundLib
 {
 public:
+    // DirectSound 全体の初期化を行う。
+    // 最初に一度だけ呼ぶ想定。
     static void Initialize(HWND windowHandle);
+
+    // 内部で保持しているバッファやキャッシュを解放する。
+    // アプリ終了時に一度だけ呼ぶ想定。
     static void Finalize();
+
+    // リスナーの位置と向きを更新する。
+    // 3D 座標つきの効果音・環境音はこの情報を使って聞こえ方を変える。
     static void Update(const Vector3& listenerPosition,
                        const Vector3& listenerFront,
                        const Vector3& listenerTop);
 
+    // 効果音を事前読み込みする。
+    // 効果音は即時反応が欲しいので、Play 前にロードしておく前提。
     static void LoadSoundEffect(const std::wstring& filePath);
+
+    // 読み込み済みの効果音を再生する。
+    // 戻り値は停止に使う再生ID。
+    // sourcePosition を指定した場合は、リスナーとの相対位置で音量と左右差を付ける。
     static int PlaySoundEffect(const std::wstring& filePath,
                                int volume = 100,
                                const Vector3* sourcePosition = nullptr,
                                EffectType effectType = EffectType::None);
+
+    // 指定IDの効果音を停止する。
     static void StopSoundEffect(int id);
 
+    // BGM を再生する。
+    // すでに別の BGM が鳴っている場合は、現在の BGM をフェードアウトしてから切り替える。
     static void PlayBgm(const std::wstring& filePath,
                         int volume = 100,
                         float startSeconds = 0.0f);
+
+    // 現在の BGM をフェードアウト付きで停止する。
     static void StopBgm();
+
+    // BGM の目標音量を変更する。
+    // フェード中ならその途中値から新しい音量へ向かう。
     static void SetBgmVolume(int volume);
 
+    // 環境音を再生する。
+    // 戻り値は停止や音量変更に使う再生ID。
+    // 効果音と違って事前 Load は不要で、必要になった時点で内部ロードする。
     static int PlayEnvironmentSound(const std::wstring& filePath,
                                     int volume = 100,
                                     const Vector3* sourcePosition = nullptr,
                                     EffectType effectType = EffectType::None,
                                     bool loop = true);
+
+    // 指定IDの環境音をフェードアウト付きで停止する。
     static void StopEnvironmentSound(int id);
+
+    // 指定IDの環境音の音量を変更する。
     static void SetEnvironmentSoundVolume(int id, int volume);
 };
 
