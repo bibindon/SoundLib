@@ -1093,7 +1093,7 @@ int SoundLib::PlaySoundEffect(const std::wstring& filePath,
     RefreshFinishedVoices(g_state.soundEffects);
     if (g_state.soundEffects.size() >= kMaxSimultaneousSoundEffects)
     {
-        throw std::runtime_error("The sound effect voice limit was exceeded.");
+        return -1;
     }
 
     const WavFile& wavFile = cacheIterator->second;
