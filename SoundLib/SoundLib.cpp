@@ -114,7 +114,8 @@ int CreateEnvironmentVoice(const std::wstring& filePath,
                            const Vector3* sourcePosition,
                            EffectType effectType,
                            bool loop,
-                           DWORD startOffsetBytes);
+                           DWORD startOffsetBytes,
+                           int restoredVoiceId = -1);
 
 // HRESULT をチェックして、失敗時は例外へ変換する。
 // DirectSound は多くの API が HRESULT を返すため、
@@ -123,7 +124,7 @@ void ThrowIfFailed(HRESULT result, const char* message)
 {
     if (FAILED(result))
     {
-        throw std::runtime_error(message);
+        throw AudioDeviceException(message);
     }
 }
 
@@ -886,7 +887,8 @@ void RebuildAudioDevice()
                                position,
                                voice.effectType,
                                voice.isLoop,
-                               voice.resumeOffsetBytes);
+                               voice.resumeOffsetBytes,
+                               voice.id);
     }
 }
 
@@ -908,7 +910,8 @@ int CreateEnvironmentVoice(const std::wstring& filePath,
                            const Vector3* sourcePosition,
                            EffectType effectType,
                            bool loop,
-                           DWORD startOffsetBytes)
+                           DWORD startOffsetBytes,
+                           const int restoredVoiceId)
 {
     RefreshFinishedVoices(g_state.environmentSounds);
     if (g_state.environmentSounds.size() >= kMaxSimultaneousEnvironmentSounds)
@@ -919,7 +922,14 @@ int CreateEnvironmentVoice(const std::wstring& filePath,
     WavFile& wavFile = GetStreamedWave(filePath);
 
     Voice voice {};
-    voice.id = AcquireVoiceId();
+    if (restoredVoiceId >= 0)
+    {
+        voice.id = restoredVoiceId;
+    }
+    else
+    {
+        voice.id = AcquireVoiceId();
+    }
     voice.filePath = filePath;
     voice.targetVolume = volume;
     voice.isLoop = loop;
@@ -965,38 +975,41 @@ void SoundLib::Initialize(HWND windowHandle)
     }
 
     g_state.windowHandle = windowHandle;
-    const HRESULT comResult = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
-    if (SUCCEEDED(comResult))
+    try
     {
-        g_state.comInitialized = true;
+        const HRESULT comResult = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
+        if (SUCCEEDED(comResult))
+        {
+            g_state.comInitialized = true;
+        }
+        else if (comResult != RPC_E_CHANGED_MODE)
+        {
+            ThrowIfFailed(comResult, "Failed to initialize COM.");
+        }
+
+        ThrowIfFailed(CoCreateInstance(__uuidof(MMDeviceEnumerator),
+                                       nullptr,
+                                       CLSCTX_ALL,
+                                       IID_PPV_ARGS(g_state.deviceEnumerator.GetAddressOf())),
+                      "Failed to create the MMDeviceEnumerator.");
+
+        g_state.defaultRenderDeviceId = GetDefaultRenderDeviceId();
+        CreateDirectSoundDevice();
+
+        g_state.soundEffects.reserve(kMaxSimultaneousSoundEffects);
+        g_state.environmentSounds.reserve(kMaxSimultaneousEnvironmentSounds);
+        g_state.initialized = true;
     }
-    else if (comResult != RPC_E_CHANGED_MODE)
+    catch (const std::runtime_error& error)
     {
-        ThrowIfFailed(comResult, "Failed to initialize COM.");
+        Finalize();
+        throw AudioDeviceException(error.what());
     }
-
-    ThrowIfFailed(CoCreateInstance(__uuidof(MMDeviceEnumerator),
-                                   nullptr,
-                                   CLSCTX_ALL,
-                                   IID_PPV_ARGS(g_state.deviceEnumerator.GetAddressOf())),
-                  "Failed to create the MMDeviceEnumerator.");
-
-    g_state.defaultRenderDeviceId = GetDefaultRenderDeviceId();
-    CreateDirectSoundDevice();
-
-    g_state.soundEffects.reserve(kMaxSimultaneousSoundEffects);
-    g_state.environmentSounds.reserve(kMaxSimultaneousEnvironmentSounds);
-    g_state.initialized = true;
 }
 
 void SoundLib::Finalize()
 {
     // 再生停止とキャッシュ解放、COM 解放をまとめて行う。
-    if (!g_state.initialized)
-    {
-        return;
-    }
-
     for (auto& voice : g_state.soundEffects)
     {
         if (voice.buffer)
@@ -1045,27 +1058,38 @@ void SoundLib::Update(const Vector3& listenerPosition,
     g_state.listenerFront = listenerFront;
     g_state.listenerTop = listenerTop;
 
-    RefreshDeviceIfNeeded();
+    try
+    {
+        RefreshDeviceIfNeeded();
 
-    ThrowIfFailed(g_state.listener3D->SetPosition(listenerPosition.x,
-                                                  listenerPosition.y,
-                                                  listenerPosition.z,
-                                                  DS3D_DEFERRED),
-                  "Failed to update the listener position.");
-    ThrowIfFailed(g_state.listener3D->SetOrientation(listenerFront.x,
-                                                     listenerFront.y,
-                                                     listenerFront.z,
-                                                     listenerTop.x,
-                                                     listenerTop.y,
-                                                     listenerTop.z,
-                                                     DS3D_DEFERRED),
-                  "Failed to update the listener orientation.");
-    ThrowIfFailed(g_state.listener3D->CommitDeferredSettings(), "Failed to commit deferred 3D settings.");
+        ThrowIfFailed(g_state.listener3D->SetPosition(listenerPosition.x,
+                                                      listenerPosition.y,
+                                                      listenerPosition.z,
+                                                      DS3D_DEFERRED),
+                      "Failed to update the listener position.");
+        ThrowIfFailed(g_state.listener3D->SetOrientation(listenerFront.x,
+                                                         listenerFront.y,
+                                                         listenerFront.z,
+                                                         listenerTop.x,
+                                                         listenerTop.y,
+                                                         listenerTop.z,
+                                                         DS3D_DEFERRED),
+                      "Failed to update the listener orientation.");
+        ThrowIfFailed(g_state.listener3D->CommitDeferredSettings(), "Failed to commit deferred 3D settings.");
 
-    RefreshFinishedVoices(g_state.soundEffects);
-    UpdateSoundEffectSpatialization();
-    UpdateEnvironmentFades();
-    UpdateBgmFade();
+        RefreshFinishedVoices(g_state.soundEffects);
+        UpdateSoundEffectSpatialization();
+        UpdateEnvironmentFades();
+        UpdateBgmFade();
+    }
+    catch (const AudioDeviceException&)
+    {
+        throw;
+    }
+    catch (const std::runtime_error& error)
+    {
+        throw AudioDeviceException(error.what());
+    }
 }
 
 void SoundLib::LoadSoundEffect(const std::wstring& filePath)

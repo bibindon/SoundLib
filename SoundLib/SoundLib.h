@@ -62,10 +62,20 @@
 
 #include <Windows.h>
 
+#include <stdexcept>
 #include <string>
 
 namespace SoundLib
 {
+
+class AudioDeviceException : public std::runtime_error
+{
+public:
+    explicit AudioDeviceException(const std::string& message)
+        : std::runtime_error(message)
+    {
+    }
+};
 
 struct Vector3
 {
