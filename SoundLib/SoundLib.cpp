@@ -1060,7 +1060,14 @@ void SoundLib::Update(const Vector3& listenerPosition,
 
     try
     {
-        RefreshDeviceIfNeeded();
+        // 既定デバイスの変更チェックは毎フレーム必要ないため、30フレームごとに実行する。
+        static int deviceCheckFrameCounter = 0;
+        ++deviceCheckFrameCounter;
+        if (deviceCheckFrameCounter >= 30)
+        {
+            deviceCheckFrameCounter = 0;
+            RefreshDeviceIfNeeded();
+        }
 
         ThrowIfFailed(g_state.listener3D->SetPosition(listenerPosition.x,
                                                       listenerPosition.y,
